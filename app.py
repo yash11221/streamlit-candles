@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from io import StringIO
+from datetime import datetime
 
 st.set_page_config(page_title="Candles + GANBOX Viewer", layout="wide")
 
@@ -17,16 +18,13 @@ Upload a CSV with OHLC (and a datetime column). The app auto-detects common colu
 """
 )
 
-# ----- Upload -----
-uploaded = st.file_uploader("Upload CSV file", type=["csv"], help="CSV with Gmt time,Open,High,Low,Close or similar")
-
-# Quick helper to try many name variants
+# ----- Helpers -----
 def find_column(cols, candidates):
     lower = {c.lower(): c for c in cols}
     for cand in candidates:
         if cand.lower() in lower:
             return lower[cand.lower()]
-    # try fuzzy: contains
+    # try partial contains
     for cand in candidates:
         for c in cols:
             if cand.lower() in c.lower():
@@ -35,12 +33,11 @@ def find_column(cols, candidates):
 
 @st.cache_data(show_spinner=False)
 def load_csv_bytes(uploaded_file):
-    # read raw bytes to let pandas sniff separators
     data = uploaded_file.getvalue().decode("utf-8", errors="replace")
     return StringIO(data)
 
 def parse_df(raw_io):
-    # Try common separators
+    raw_io.seek(0)
     try:
         df = pd.read_csv(raw_io)
     except Exception:
@@ -49,38 +46,32 @@ def parse_df(raw_io):
     return df
 
 def preprocess_df(df):
-    # standardize column names
     orig_cols = list(df.columns)
     cols_map = {c: c.strip() for c in orig_cols}
     df = df.rename(columns=cols_map)
     cols = list(df.columns)
 
-    # detect time column
     time_col = find_column(cols, ["gmt_time", "time", "datetime", "date", "timestamp", "date_time"])
     if time_col is None:
         st.warning("Couldn't find a datetime column automatically. Please provide a column named 'gmt_time' or 'time' or similar.")
         raise ValueError("No datetime column found")
 
-    # detect OHLC
     open_col = find_column(cols, ["open", "o", "bidopen"])
     high_col = find_column(cols, ["high", "h"])
     low_col = find_column(cols, ["low", "l"])
     close_col = find_column(cols, ["close", "c", "bidclose", "last"])
 
     if not all([open_col, high_col, low_col, close_col]):
-        missing = [n for n,v in zip(["open","high","low","close"], [open_col,high_col,low_col,close_col]) if v is None]
+        missing = [n for n, v in zip(["open", "high", "low", "close"], [open_col, high_col, low_col, close_col]) if v is None]
         st.warning(f"Missing columns detected: {missing}. Found columns: {cols}.")
         raise ValueError("Missing OHLC columns")
 
-    # parse datetimes safely
     try:
         df[time_col] = pd.to_datetime(df[time_col], errors='coerce', infer_datetime_format=True)
     except Exception:
         df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
-    df = df.dropna(subset=[time_col])
-    df = df.sort_values(by=time_col).reset_index(drop=True)
+    df = df.dropna(subset=[time_col]).sort_values(by=time_col).reset_index(drop=True)
 
-    # rename to standard names
     df = df.rename(columns={
         time_col: "time",
         open_col: "open",
@@ -89,13 +80,14 @@ def preprocess_df(df):
         close_col: "close"
     })
 
-    # ensure numeric
     for c in ["open", "high", "low", "close"]:
         df[c] = pd.to_numeric(df[c], errors='coerce')
-    df = df.dropna(subset=["open","high","low","close"]).reset_index(drop=True)
+    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     return df
 
-# ----- App controls -----
+# ----- Upload -----
+uploaded = st.file_uploader("Upload CSV file", type=["csv"], help="CSV with Gmt time,Open,High,Low,Close or similar")
+
 if uploaded:
     try:
         raw_io = load_csv_bytes(uploaded)
@@ -107,8 +99,8 @@ if uploaded:
 
     st.success(f"Loaded {len(df):,} rows. Time range: {df['time'].min()} → {df['time'].max()}")
 
-    # user options
-    col1, col2, col3 = st.columns([1.2,1,1])
+    # Controls
+    col1, col2, col3 = st.columns([1.2, 1, 1])
     with col1:
         show_ganbox = st.checkbox("Show GANBOX midline (0.5)", value=True)
         show_full_ganbox = st.checkbox("Show full GANBOX levels (0.0,0.25,0.5,0.75,1.0)", value=False)
@@ -117,15 +109,30 @@ if uploaded:
     with col3:
         resample_agg = st.selectbox("Resample (optional)", options=["None","1T","5T","15T","30T","60T"], index=1, help="Aggregate candles (T = minutes). Useful for heavy data.")
 
-    # allow date range selection
+    # Date range slider - convert to python datetimes for Streamlit compatibility
     min_time = df['time'].min()
     max_time = df['time'].max()
-    start_end = st.slider("Date range", min_value=min_time, max_value=max_time, value=(min_time, max_time), format="YYYY-MM-DD HH:mm")
+    try:
+        min_time_py = min_time.to_pydatetime()
+        max_time_py = max_time.to_pydatetime()
+    except Exception:
+        min_time_py = pd.to_datetime(min_time).to_pydatetime()
+        max_time_py = pd.to_datetime(max_time).to_pydatetime()
+
+    # Ensure slider value also uses python datetimes
+    start_end = st.slider(
+        "Date range",
+        min_value=min_time_py,
+        max_value=max_time_py,
+        value=(min_time_py, max_time_py),
+        format="YYYY-MM-DD HH:mm"
+    )
     start_dt, end_dt = start_end
 
+    # Filter by date range
     df = df[(df['time'] >= pd.to_datetime(start_dt)) & (df['time'] <= pd.to_datetime(end_dt))]
 
-    # optional resampling (requires time as index)
+    # Optional resampling
     if resample_agg != "None":
         df = df.set_index("time").resample(resample_agg).agg({
             "open":"first",
@@ -134,14 +141,14 @@ if uploaded:
             "close":"last"
         }).dropna().reset_index()
 
-    # downsample if too many points (uniform sampling)
+    # Downsample if needed
     n = len(df)
     if n > downsample:
         factor = int(np.ceil(n / downsample))
         df = df.iloc[::factor].reset_index(drop=True)
         st.info(f"Downsampled to {len(df):,} points (every {factor}th row).")
 
-    # compute GANBOX midline and optional levels
+    # GANBOX calculations
     df['ganbox_midline'] = (df['high'] + df['low']) / 2.0
     if show_full_ganbox:
         df['ganbox_0'] = df['low']
@@ -150,9 +157,8 @@ if uploaded:
         df['ganbox_75'] = df['low'] + 0.75 * (df['high'] - df['low'])
         df['ganbox_100'] = df['high']
 
-    # Plotly candlestick
+    # Plot
     fig = go.Figure()
-
     fig.add_trace(go.Candlestick(
         x=df['time'],
         open=df['open'],
@@ -176,7 +182,6 @@ if uploaded:
     if show_full_ganbox:
         fig.add_trace(go.Scatter(x=df['time'], y=df['ganbox_25'], mode='lines', name='GANBOX 0.25', line=dict(dash='dash', width=1)))
         fig.add_trace(go.Scatter(x=df['time'], y=df['ganbox_75'], mode='lines', name='GANBOX 0.75', line=dict(dash='dash', width=1)))
-        # top/bottom thin lines
         fig.add_trace(go.Scatter(x=df['time'], y=df['ganbox_0'], mode='lines', name='GANBOX 0.0', line=dict(width=0.6)))
         fig.add_trace(go.Scatter(x=df['time'], y=df['ganbox_100'], mode='lines', name='GANBOX 1.0', line=dict(width=0.6)))
 
@@ -189,7 +194,7 @@ if uploaded:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # show a small table preview and download trimmed dataset
+    # Data preview + download
     with st.expander("Data preview & download"):
         st.dataframe(df.head(200))
         csv = df.to_csv(index=False).encode('utf-8')
